@@ -2,18 +2,8 @@ require('dotenv').config();
 const fs = require('node:fs');
 const path = require('node:path');
 const {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  PermissionFlagsBits,
-  SlashCommandBuilder,
-  REST,
-  Routes,
-  EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  ChannelType,
+  Client, GatewayIntentBits, Partials, PermissionFlagsBits, SlashCommandBuilder,
+  REST, Routes, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType,
 } = require('discord.js');
 
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -130,7 +120,7 @@ client.on('interactionCreate', async interaction => {
       if (!canModerate(interaction)) return interaction.reply({ content: 'You need moderation permissions.', ephemeral: true });
       const [, action, userId] = interaction.customId.split(':');
       const status = action === 'approve' ? 'Approved' : 'Denied';
-      const embed = EmbedBuilder.from(interaction.message.embeds[0]).spliceFields(1, 1, { name: 'Status', value: `${status} by ${interaction.user}` });
+      const embed = EmbedBuilder.from(interaction.message.embeds[0]).spliceFields(1, 1, { name: 'Status', value: status });
       await interaction.update({ embeds: [embed], components: [] });
       if (action === 'approve') {
         try { await interaction.guild.bans.remove(userId, 'Ban appeal approved'); } catch {}
