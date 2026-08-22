@@ -30,6 +30,7 @@ const guildConfig = (id) => {
   return db.guilds[id];
 };
 const render = (text, vars) => text.replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? `{${k}}`);
+const infractionId = () => `SI-${Math.floor(1000 + Math.random() * 9000)}`;
 
 const commands = [
   new SlashCommandBuilder().setName('infraction').setDescription('Manage member infractions')
@@ -74,22 +75,45 @@ client.on('interactionCreate', async interaction => {
           cfg.infractions[user.id].pop(); save();
           return interaction.reply({ content: `Removed the latest infraction from ${user}.` });
         }
+
         const reason = interaction.options.getString('reason');
-        cfg.infractions[user.id].push({ reason, at: Date.now(), moderator: interaction.user.id });
+        const id = infractionId();
+        cfg.infractions[user.id].push({ reason, at: Date.now(), moderator: interaction.user.id, id });
         const count = cfg.infractions[user.id].length;
         const member = await interaction.guild.members.fetch(user.id);
         const rules = [...cfg.promotions].sort((a,b) => b.count-a.count);
         const rule = rules.find(r => count >= r.count && !member.roles.cache.has(r.roleId));
+        let promotedRole = null;
+
         if (rule) {
           const role = interaction.guild.roles.cache.get(rule.roleId);
           if (role && role.position < interaction.guild.members.me.roles.highest.position) {
             await member.roles.add(role, `Automatic promotion at ${count} infractions`);
+            promotedRole = role;
             const channel = cfg.channels.promotions ? interaction.guild.channels.cache.get(cfg.channels.promotions) : interaction.channel;
             if (channel) await channel.send(render(cfg.messages.promotion, { user: `<@${user.id}>`, role: role.name, count }));
           }
         }
+
         save();
-        return interaction.reply({ content: `Added infraction #${count} to ${user}.` });
+
+        // Clean Sheriff-style infraction panel. No bot/avatar icon is used in the author/header.
+        const embed = new EmbedBuilder()
+          .setColor(0xF2C94C)
+          .setTitle('Infraction')
+          .setDescription('An infraction has been issued on this member.')
+          .setThumbnail(user.displayAvatarURL({ extension: 'png', size: 128 }))
+          .addFields(
+            { name: 'User', value: `<@${user.id}>`, inline: true },
+            { name: 'Punishment', value: promotedRole ? promotedRole.name : `Infraction #${count}`, inline: true },
+            { name: 'Type', value: 'Staff Infraction', inline: false },
+            { name: 'Reason', value: reason, inline: false },
+            { name: 'Issued By', value: `<@${interaction.user.id}>`, inline: false },
+            { name: 'Appeal Status', value: 'Unappealable', inline: false },
+          )
+          .setFooter({ text: `${id} • ${new Date().toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })}` });
+
+        return interaction.reply({ embeds: [embed] });
       }
 
       if (interaction.commandName === 'promotion') {
