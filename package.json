@@ -1,0 +1,17 @@
+{
+  "name": "sheriff",
+  "version": "1.0.0",
+  "description": "Discord moderation bot for infractions, automatic role promotions, ban appeals and configurable channel messages.",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "discord.js": "^14.25.1",
+    "dotenv": "^17.2.1"
+  }
+}
