@@ -1,159 +1,21 @@
 require('dotenv').config();
 const fs = require('node:fs');
 const path = require('node:path');
-const {
-  Client, GatewayIntentBits, Partials, PermissionFlagsBits, SlashCommandBuilder,
-  REST, Routes, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType,
-} = require('discord.js');
-
-const TOKEN = process.env.DISCORD_TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
-const GUILD_ID = process.env.GUILD_ID;
+const { Client, GatewayIntentBits, Partials, PermissionFlagsBits, SlashCommandBuilder, REST, Routes, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType } = require('discord.js');
+const TOKEN = process.env.DISCORD_TOKEN; const CLIENT_ID = process.env.CLIENT_ID; const GUILD_ID = process.env.GUILD_ID;
 if (!TOKEN || !CLIENT_ID) throw new Error('Set DISCORD_TOKEN and CLIENT_ID in .env');
-
-const DATA_DIR = path.join(__dirname, '..', 'data');
-const DATA_FILE = path.join(DATA_DIR, 'sheriff.json');
-fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({ guilds: {} }, null, 2));
-const db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-const save = () => fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
-const guildConfig = (id) => {
-  db.guilds[id] ??= {
-    infractions: {},
-    promotions: [],
-    channels: {},
-    messages: {
-      promotion: '🎉 {user} has been promoted to **{role}** after reaching {count} infractions.',
-      appeal: '📝 Ban appeal from **{user}**. Reason: {reason}',
-    },
-  };
-  return db.guilds[id];
-};
-const render = (text, vars) => text.replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? `{${k}}`);
-const infractionId = () => `SI-${Math.floor(1000 + Math.random() * 9000)}`;
-
-const commands = [
-  new SlashCommandBuilder().setName('infraction').setDescription('Manage member infractions')
-    .addSubcommand(s => s.setName('add').setDescription('Add an infraction').addUserOption(o => o.setName('user').setDescription('Member').setRequired(true)).addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true)))
-    .addSubcommand(s => s.setName('remove').setDescription('Remove one infraction').addUserOption(o => o.setName('user').setDescription('Member').setRequired(true)))
-    .addSubcommand(s => s.setName('view').setDescription('View infractions').addUserOption(o => o.setName('user').setDescription('Member').setRequired(true))),
-  new SlashCommandBuilder().setName('promotion').setDescription('Configure automatic promotion thresholds')
-    .addSubcommand(s => s.setName('add').setDescription('Promote at an infraction count').addIntegerOption(o => o.setName('count').setDescription('Infraction count').setMinValue(1).setRequired(true)).addRoleOption(o => o.setName('role').setDescription('Role to add').setRequired(true)))
-    .addSubcommand(s => s.setName('list').setDescription('List promotion rules')),
-  new SlashCommandBuilder().setName('appeal').setDescription('Submit a ban appeal').addStringOption(o => o.setName('reason').setDescription('Why should the ban be removed?').setRequired(true)),
-  new SlashCommandBuilder().setName('config').setDescription('Configure Sheriff')
-    .addSubcommand(s => s.setName('channel').setDescription('Set a feature channel').addStringOption(o => o.setName('type').setDescription('Channel purpose').setRequired(true).addChoices({name:'appeals',value:'appeals'},{name:'promotions',value:'promotions'},{name:'logs',value:'logs'})).addChannelOption(o => o.setName('channel').setDescription('Channel').addChannelTypes(ChannelType.GuildText).setRequired(true)))
-    .addSubcommand(s => s.setName('message').setDescription('Set a custom message template').addStringOption(o => o.setName('type').setDescription('Message type').setRequired(true).addChoices({name:'promotion',value:'promotion'},{name:'appeal',value:'appeal'})).addStringOption(o => o.setName('text').setDescription('Template').setRequired(true))),
-].map(c => c.toJSON());
-
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers], partials: [Partials.GuildMember] });
-
-async function register() {
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
-  if (GUILD_ID) await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-  else await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-}
-
-function canModerate(interaction) {
-  return interaction.memberPermissions?.has(PermissionFlagsBits.ModerateMembers) || interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
-}
-
-client.once('ready', () => console.log(`Sheriff online as ${client.user.tag}`));
-
-client.on('interactionCreate', async interaction => {
-  try {
-    if (interaction.isChatInputCommand()) {
-      const cfg = guildConfig(interaction.guildId);
-      if (['infraction', 'promotion', 'config'].includes(interaction.commandName) && !canModerate(interaction)) return interaction.reply({ content: 'You need moderation permissions to use this command.', ephemeral: true });
-
-      if (interaction.commandName === 'infraction') {
-        const user = interaction.options.getUser('user');
-        cfg.infractions[user.id] ??= [];
-        const sub = interaction.options.getSubcommand();
-        if (sub === 'view') return interaction.reply({ content: `**${user.tag}** has **${cfg.infractions[user.id].length}** infraction(s).\n${cfg.infractions[user.id].map((x,i)=>`${i+1}. ${x.reason} — <t:${Math.floor(x.at/1000)}:R>`).join('\n') || 'None.'}` });
-        if (sub === 'remove') {
-          cfg.infractions[user.id].pop(); save();
-          return interaction.reply({ content: `Removed the latest infraction from ${user}.` });
-        }
-
-        const reason = interaction.options.getString('reason');
-        const id = infractionId();
-        cfg.infractions[user.id].push({ reason, at: Date.now(), moderator: interaction.user.id, id });
-        const count = cfg.infractions[user.id].length;
-        const member = await interaction.guild.members.fetch(user.id);
-        const rules = [...cfg.promotions].sort((a,b) => b.count-a.count);
-        const rule = rules.find(r => count >= r.count && !member.roles.cache.has(r.roleId));
-        let promotedRole = null;
-
-        if (rule) {
-          const role = interaction.guild.roles.cache.get(rule.roleId);
-          if (role && role.position < interaction.guild.members.me.roles.highest.position) {
-            await member.roles.add(role, `Automatic promotion at ${count} infractions`);
-            promotedRole = role;
-            const channel = cfg.channels.promotions ? interaction.guild.channels.cache.get(cfg.channels.promotions) : interaction.channel;
-            if (channel) await channel.send(render(cfg.messages.promotion, { user: `<@${user.id}>`, role: role.name, count }));
-          }
-        }
-
-        save();
-
-        // Clean Sheriff-style infraction panel. No bot/avatar icon is used in the author/header.
-        const embed = new EmbedBuilder()
-          .setColor(0xF2C94C)
-          .setTitle('Infraction')
-          .setDescription('An infraction has been issued on this member.')
-          .setThumbnail(user.displayAvatarURL({ extension: 'png', size: 128 }))
-          .addFields(
-            { name: 'User', value: `<@${user.id}>`, inline: true },
-            { name: 'Punishment', value: promotedRole ? promotedRole.name : `Infraction #${count}`, inline: true },
-            { name: 'Type', value: 'Staff Infraction', inline: false },
-            { name: 'Reason', value: reason, inline: false },
-            { name: 'Issued By', value: `<@${interaction.user.id}>`, inline: false },
-            { name: 'Appeal Status', value: 'Unappealable', inline: false },
-          )
-          .setFooter({ text: `${id} • ${new Date().toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })}` });
-
-        return interaction.reply({ embeds: [embed] });
-      }
-
-      if (interaction.commandName === 'promotion') {
-        if (interaction.options.getSubcommand() === 'list') return interaction.reply({ content: cfg.promotions.map(r => `${r.count} infractions → <@&${r.roleId}>`).join('\n') || 'No promotion rules configured.' });
-        const count = interaction.options.getInteger('count'); const role = interaction.options.getRole('role');
-        cfg.promotions.push({ count, roleId: role.id }); save();
-        return interaction.reply({ content: `Promotion rule added: ${count} infractions → ${role}.` });
-      }
-
-      if (interaction.commandName === 'config') {
-        const sub = interaction.options.getSubcommand();
-        if (sub === 'channel') { cfg.channels[interaction.options.getString('type')] = interaction.options.getChannel('channel').id; save(); return interaction.reply({ content: 'Channel configured.' }); }
-        cfg.messages[interaction.options.getString('type')] = interaction.options.getString('text'); save();
-        return interaction.reply({ content: 'Message template updated. Variables: `{user}`, `{role}`, `{count}`, `{reason}`.' });
-      }
-
-      if (interaction.commandName === 'appeal') {
-        const reason = interaction.options.getString('reason');
-        const channel = cfg.channels.appeals ? interaction.guild.channels.cache.get(cfg.channels.appeals) : interaction.channel;
-        const embed = new EmbedBuilder().setTitle('Ban Appeal').setDescription(render(cfg.messages.appeal, { user: `<@${interaction.user.id}>`, reason })).addFields({ name: 'User ID', value: interaction.user.id }, { name: 'Status', value: 'Pending' }).setTimestamp();
-        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`appeal:approve:${interaction.user.id}`).setLabel('Approve').setStyle(ButtonStyle.Success), new ButtonBuilder().setCustomId(`appeal:deny:${interaction.user.id}`).setLabel('Deny').setStyle(ButtonStyle.Danger));
-        await channel.send({ embeds: [embed], components: [row] });
-        return interaction.reply({ content: 'Your ban appeal has been submitted.', ephemeral: true });
-      }
-    }
-
-    if (interaction.isButton() && interaction.customId.startsWith('appeal:')) {
-      if (!canModerate(interaction)) return interaction.reply({ content: 'You need moderation permissions.', ephemeral: true });
-      const [, action, userId] = interaction.customId.split(':');
-      const status = action === 'approve' ? 'Approved' : 'Denied';
-      const embed = EmbedBuilder.from(interaction.message.embeds[0]).spliceFields(1, 1, { name: 'Status', value: status });
-      await interaction.update({ embeds: [embed], components: [] });
-      if (action === 'approve') {
-        try { await interaction.guild.bans.remove(userId, 'Ban appeal approved'); } catch {}
-      }
-    }
-  } catch (err) {
-    console.error(err);
-    if (interaction.isRepliable() && !interaction.replied) await interaction.reply({ content: 'Something went wrong. Check the bot console.', ephemeral: true });
-  }
-});
-
-register().then(() => client.login(TOKEN));
+const DATA_DIR = path.join(__dirname, '..', 'data'); const DATA_FILE = path.join(DATA_DIR, 'sheriff.json'); fs.mkdirSync(DATA_DIR,{recursive:true});
+if(!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE,JSON.stringify({guilds:{}},null,2)); const db=JSON.parse(fs.readFileSync(DATA_FILE,'utf8')); const save=()=>fs.writeFileSync(DATA_FILE,JSON.stringify(db,null,2));
+const guildConfig=id=>{db.guilds[id]??={infractions:{},promotions:[],channels:{},messages:{promotion:'🎉 {user} has been promoted to **{role}** after reaching {count} infractions.',appeal:'📝 Ban appeal from **{user}**. Reason: {reason}',recruitment:'`🚔` **WASHINGTON SHERIFF’S OFFICE | RECRUITMENT APPLICATIONS NOW OPEN** `🚔`\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n**Are you ready to take the next step and become a member of the Washington Sheriff’s Office?**\n\nThe **Washington Sheriff’s Office** is officially accepting applications from individuals who are motivated, mature, professional, and willing to dedicate their time to serving and protecting our community.\n\nWe are looking for members who can demonstrate **leadership, professionalism, communication, teamwork, responsibility, and integrity** both in and out of roleplay.\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📋 **APPLICATION REQUIREMENTS**\n\nBefore submitting your application, please ensure that you:\n\n> 🔹 Answer **every question** honestly and thoroughly.\n>\n> 🔹 Provide detailed responses rather than one-word or short answers.\n>\n> 🔹 Demonstrate professionalism throughout your application.\n>\n> 🔹 Use proper **spelling, punctuation, grammar, and capitalization (SPaG)**.\n>\n> 🔹 Have a genuine interest in law enforcement roleplay and serving the community.\n>\n> 🔹 Understand that your application may be reviewed by multiple members of Sheriff’s Office leadership.\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ **IMPORTANT INFORMATION**\n\nApplications that are **low-effort, rushed, incomplete, copied, troll-related, or intentionally misleading** may be denied without further consideration.\n\nSubmitting an application does **not** guarantee acceptance into the Washington Sheriff’s Office. Every application will be reviewed based on the applicant’s responses, maturity, professionalism, experience, activity, and overall suitability for the position.\n\n🚨 **Please take your time when completing your application.**\n\nA well-written and detailed application gives leadership a much better understanding of who you are and what you can bring to the department.\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👮 **WHAT WE LOOK FOR**\n\nOur ideal applicants demonstrate:\n\n> 🛡️ **Integrity** — Always doing the right thing, even when nobody is watching.\n>\n> 🤝 **Teamwork** — Working effectively alongside other members and departments.\n>\n> 🗣️ **Communication** — Communicating clearly and professionally.\n>\n> 🎯 **Discipline** — Following department procedures and leadership instructions.\n>\n> ⭐ **Professionalism** — Representing the Sheriff’s Office appropriately.\n>\n> 📚 **Willingness to Learn** — Being open to training, feedback, and improvement.\n>\n> 🚔 **Commitment** — Being willing to actively participate and contribute to the department.\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📝 **BEFORE YOU APPLY**\n\nPlease make sure you have enough time to complete the application properly. **Do not rush your responses.**\n\nLeadership may contact you regarding your application if additional information or clarification is required.\n\n📌 **Reminder:** Using AI, copying another applicant’s answers, or intentionally providing false information may result in your application being denied.\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🎖️ **READY TO JOIN?**\n\nIf you believe you have what it takes to represent the **Washington Sheriff’s Office**, demonstrate your commitment, and become part of our team, we encourage you to apply.\n\n**Good luck to everyone applying!**\n\n**We look forward to reviewing your applications.** 👮‍♂️🚔\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🔗 **APPLICATION PORTAL**\n\nTo begin your application, please click the link below:\n\n👉 [**CLICK HERE TO APPLY**](https://melon.ly/form/7489761750036779008)\n\n**Washington Sheriff’s Office**\n\n*Serve • Protect • Professionalism • Integrity* 🚔'}};return db.guilds[id]};
+const render=(text,vars)=>text.replace(/\{(\w+)\}/g,(_,k)=>vars[k]??`{${k}}`); const infractionId=()=>`SI-${Math.floor(1000+Math.random()*9000)}`;
+const commands=[new SlashCommandBuilder().setName('infraction').setDescription('Manage member infractions').addSubcommand(s=>s.setName('add').setDescription('Add an infraction').addUserOption(o=>o.setName('user').setDescription('Member').setRequired(true)).addStringOption(o=>o.setName('reason').setDescription('Reason').setRequired(true))).addSubcommand(s=>s.setName('remove').setDescription('Remove one infraction').addUserOption(o=>o.setName('user').setDescription('Member').setRequired(true))).addSubcommand(s=>s.setName('view').setDescription('View infractions').addUserOption(o=>o.setName('user').setDescription('Member').setRequired(true))),new SlashCommandBuilder().setName('promotion').setDescription('Configure automatic promotion thresholds').addSubcommand(s=>s.setName('add').setDescription('Promote at an infraction count').addIntegerOption(o=>o.setName('count').setDescription('Infraction count').setMinValue(1).setRequired(true)).addRoleOption(o=>o.setName('role').setDescription('Role to add').setRequired(true))).addSubcommand(s=>s.setName('list').setDescription('List promotion rules')),new SlashCommandBuilder().setName('appeal').setDescription('Submit a ban appeal').addStringOption(o=>o.setName('reason').setDescription('Why should the ban be removed?').setRequired(true)),new SlashCommandBuilder().setName('recruitment').setDescription('Post the Washington Sheriff’s Office recruitment message'),new SlashCommandBuilder().setName('config').setDescription('Configure Sheriff').addSubcommand(s=>s.setName('channel').setDescription('Set a feature channel').addStringOption(o=>o.setName('type').setDescription('Channel purpose').setRequired(true).addChoices({name:'appeals',value:'appeals'},{name:'promotions',value:'promotions'},{name:'logs',value:'logs'},{name:'recruitment',value:'recruitment'})).addChannelOption(o=>o.setName('channel').setDescription('Channel').addChannelTypes(ChannelType.GuildText).setRequired(true))).addSubcommand(s=>s.setName('message').setDescription('Set a custom message template').addStringOption(o=>o.setName('type').setDescription('Message type').setRequired(true).addChoices({name:'promotion',value:'promotion'},{name:'appeal',value:'appeal'},{name:'recruitment',value:'recruitment'})).addStringOption(o=>o.setName('text').setDescription('Template').setRequired(true)))].map(c=>c.toJSON());
+const client=new Client({intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildMembers],partials:[Partials.GuildMember]});
+async function register(){const rest=new REST({version:'10'}).setToken(TOKEN);if(GUILD_ID)await rest.put(Routes.applicationGuildCommands(CLIENT_ID,GUILD_ID),{body:commands});else await rest.put(Routes.applicationCommands(CLIENT_ID),{body:commands})}
+function canModerate(i){return i.memberPermissions?.has(PermissionFlagsBits.ModerateMembers)||i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)} client.once('ready',()=>console.log(`Sheriff online as ${client.user.tag}`));
+client.on('interactionCreate',async i=>{try{if(i.isChatInputCommand()){const cfg=guildConfig(i.guildId);if(['infraction','promotion','config','recruitment'].includes(i.commandName)&&!canModerate(i))return i.reply({content:'You need moderation permissions to use this command.',ephemeral:true});
+if(i.commandName==='recruitment'){const ch=cfg.channels.recruitment?i.guild.channels.cache.get(cfg.channels.recruitment):i.channel;await ch.send({content:cfg.messages.recruitment,allowedMentions:{parse:[]}});return i.reply({content:'Recruitment message sent.',ephemeral:true})}
+if(i.commandName==='infraction'){const u=i.options.getUser('user');cfg.infractions[u.id]??=[];const sub=i.options.getSubcommand();if(sub==='view')return i.reply({content:`**${u.tag}** has **${cfg.infractions[u.id].length}** infraction(s).\n${cfg.infractions[u.id].map((x,n)=>`${n+1}. ${x.reason} — <t:${Math.floor(x.at/1000)}:R>`).join('\n')||'None.'}`});if(sub==='remove'){cfg.infractions[u.id].pop();save();return i.reply({content:`Removed the latest infraction from ${u}.`})}const reason=i.options.getString('reason'),id=infractionId();cfg.infractions[u.id].push({reason,at:Date.now(),moderator:i.user.id,id});const count=cfg.infractions[u.id].length;const m=await i.guild.members.fetch(u.id);const rule=[...cfg.promotions].sort((a,b)=>b.count-a.count).find(r=>count>=r.count&&!m.roles.cache.has(r.roleId));let promotedRole=null;if(rule){const role=i.guild.roles.cache.get(rule.roleId);if(role&&role.position<i.guild.members.me.roles.highest.position){await m.roles.add(role,`Automatic promotion at ${count} infractions`);promotedRole=role;const ch=cfg.channels.promotions?i.guild.channels.cache.get(cfg.channels.promotions):i.channel;if(ch)await ch.send(render(cfg.messages.promotion,{user:`<@${u.id}>`,role:role.name,count}))}}save();const e=new EmbedBuilder().setColor(0xF2C94C).setTitle('Infraction').setDescription('An infraction has been issued on this member.').setThumbnail(u.displayAvatarURL({extension:'png',size:128})).addFields({name:'User',value:`<@${u.id}>`,inline:true},{name:'Punishment',value:promotedRole?promotedRole.name:`Infraction #${count}`,inline:true},{name:'Type',value:'Staff Infraction',inline:false},{name:'Reason',value:reason,inline:false},{name:'Issued By',value:`<@${i.user.id}>`,inline:false},{name:'Appeal Status',value:'Unappealable',inline:false}).setFooter({text:`${id} • ${new Date().toLocaleString('en-GB',{dateStyle:'medium',timeStyle:'short'})}`});return i.reply({embeds:[e]})}
+if(i.commandName==='promotion'){if(i.options.getSubcommand()==='list')return i.reply({content:cfg.promotions.map(r=>`${r.count} infractions → <@&${r.roleId}>`).join('\n')||'No promotion rules configured.'});const count=i.options.getInteger('count'),role=i.options.getRole('role');cfg.promotions.push({count,roleId:role.id});save();return i.reply({content:`Promotion rule added: ${count} infractions → ${role}.`})}
+if(i.commandName==='config'){const sub=i.options.getSubcommand();if(sub==='channel'){cfg.channels[i.options.getString('type')]=i.options.getChannel('channel').id;save();return i.reply({content:'Channel configured.'})}cfg.messages[i.options.getString('type')]=i.options.getString('text');save();return i.reply({content:'Message template updated.'})}
+if(i.commandName==='appeal'){const reason=i.options.getString('reason'),ch=cfg.channels.appeals?i.guild.channels.cache.get(cfg.channels.appeals):i.channel,e=new EmbedBuilder().setTitle('Ban Appeal').setDescription(render(cfg.messages.appeal,{user:`<@${i.user.id}>`,reason})).addFields({name:'User ID',value:i.user.id},{name:'Status',value:'Pending'}).setTimestamp(),row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`appeal:approve:${i.user.id}`).setLabel('Approve').setStyle(ButtonStyle.Success),new ButtonBuilder().setCustomId(`appeal:deny:${i.user.id}`).setLabel('Deny').setStyle(ButtonStyle.Danger));await ch.send({embeds:[e],components:[row]});return i.reply({content:'Your ban appeal has been submitted.',ephemeral:true})}}
+if(i.isButton()&&i.customId.startsWith('appeal:')){if(!canModerate(i))return i.reply({content:'You need moderation permissions.',ephemeral:true});const[,action,userId]=i.customId.split(':'),status=action==='approve'?'Approved':'Denied',e=EmbedBuilder.from(i.message.embeds[0]).spliceFields(1,1,{name:'Status',value:status});await i.update({embeds:[e],components:[]});if(action==='approve')try{await i.guild.bans.remove(userId,'Ban appeal approved')}catch{}}}catch(err){console.error(err);if(i.isRepliable()&&!i.replied)await i.reply({content:'Something went wrong. Check the bot console.',ephemeral:true})}});register().then(()=>client.login(TOKEN));
